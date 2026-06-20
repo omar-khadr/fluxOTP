@@ -1,0 +1,431 @@
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════
+# High-Availability OTP Processing System - Configuration File
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════
+# This file defines all runtime settings for the OTP system, including provider configurations,
+# resilience policies, performance thresholds, and operational parameters.
+#
+# SECURITY NOTICE: All sensitive values (API keys, passwords, Redis URLs) should be provided via
+# environment variables or secrets management (Vault, K8s Secrets), NOT hardcoded.
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# 1. SYSTEM METADATA
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+system:
+  name: "OTP-Processing-System"
+  version: "1.0.0"
+  environment: "production"  # production, staging, development
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  enable_metrics: true
+  enable_tracing: true
+  max_concurrent_tasks: 10000
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# 2. REDIS CONFIGURATION (State Management & Deduplication)
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+redis:
+  # Primary Redis cluster (can be single node or cluster)
+  primary:
+    urls:
+      - "redis://redis-primary-1:6379/0"
+      - "redis://redis-primary-2:6379/0"
+      - "redis://redis-primary-3:6379/0"
+    password: "${REDIS_PASSWORD}"  # Set via environment variable
+    db: 0
+    decode_responses: true
+    socket_connect_timeout: 10
+    socket_keepalive: true
+    pool_size: 100
+    max_connections: 500
+
+  # Replica Redis cluster (read-only, for scaling read operations)
+  replica:
+    urls:
+      - "redis://redis-replica-1:6379/0"
+    password: "${REDIS_PASSWORD}"
+    db: 0
+
+  # Cache expiration times (in seconds)
+  ttl:
+    otp_entry: 600              # 10 minutes: OTP messages are kept briefly for duplicate detection
+    dedup_key: 3600             # 1 hour: Prevent processing same OTP twice
+    provider_state: 86400       # 24 hours: Provider health state
+    rate_limit: 60              # 1 minute: Rate limit counter window
+    circuit_breaker: 300        # 5 minutes: Circuit breaker state
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# 3. MESSAGE BROKER (Event Distribution)
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+message_broker:
+  type: "kafka"  # kafka, rabbitmq, redis_streams
+  kafka:
+    bootstrap_servers:
+      - "kafka-broker-1:9092"
+      - "kafka-broker-2:9092"
+      - "kafka-broker-3:9092"
+    security_protocol: "SSL"
+    ssl_cafile: "/etc/ssl/certs/kafka-ca.pem"
+    ssl_certfile: "/etc/ssl/certs/kafka-client.pem"
+    ssl_keyfile: "/etc/ssl/certs/kafka-client-key.pem"
+    sasl_mechanism: "PLAIN"
+    sasl_username: "${KAFKA_USERNAME}"
+    sasl_password: "${KAFKA_PASSWORD}"
+    consumer_group: "otp-system"
+    auto_offset_reset: "earliest"
+    enable_auto_commit: true
+    session_timeout_ms: 30000
+    
+  topics:
+    raw_messages: "otp.raw-messages"
+    extracted_otps: "otp.extracted-otps"
+    processing_results: "otp.processing-results"
+    system_events: "otp.system-events"
+    failed_messages: "otp.failed-messages"
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# 4. DATA PROVIDERS (Message Sources)
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+providers:
+  # Email provider (IMAP-based)
+  email:
+    enabled: true
+    type: "imap"
+    priority: 1
+    servers:
+      - name: "gmail-1"
+        host: "imap.gmail.com"
+        port: 993
+        username: "${EMAIL_USER_1}"
+        password: "${EMAIL_PASS_1}"
+        ssl: true
+        check_interval_seconds: 30
+        backup_interval_seconds: 60
+        max_retries: 3
+        retry_backoff_seconds: 10
+        
+      - name: "outlook-1"
+        host: "outlook.office365.com"
+        port: 993
+        username: "${EMAIL_USER_2}"
+        password: "${EMAIL_PASS_2}"
+        ssl: true
+        check_interval_seconds: 30
+        max_retries: 3
+
+  # Webhook provider (HTTP endpoints exposing OTP messages)
+  webhook:
+    enabled: true
+    type: "http"
+    priority: 2
+    listen_port: 8080
+    listen_host: "0.0.0.0"
+    endpoints:
+      - path: "/api/v1/otp/ingest"
+        method: "POST"
+        auth_required: true
+        auth_type: "bearer_token"
+        bearer_token: "${WEBHOOK_TOKEN}"
+        rate_limit: 1000  # requests per minute
+        
+  # SMS Gateway Provider (via HTTP API)
+  sms_gateway:
+    enabled: true
+    type: "http_api"
+    priority: 3
+    provider_name: "twilio"
+    api_url: "https://api.twilio.com/2010-04-01"
+    account_sid: "${TWILIO_ACCOUNT_SID}"
+    auth_token: "${TWILIO_AUTH_TOKEN}"
+    polling_interval_seconds: 20
+    max_retries: 5
+    timeout_seconds: 30
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# 5. INTELLIGENCE ENGINE CONFIGURATION (NLP & Regex)
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+intelligence:
+  # Regex patterns for OTP extraction (ordered by priority)
+  regex_patterns:
+    - name: "standard_6digit"
+      pattern: "\\b([0-9]{6})\\b"
+      confidence_weight: 0.95
+      context_keywords: ["code", "otp", "verification", "confirm"]
+      
+    - name: "bracket_4digit"
+      pattern: "\\[([0-9]{4})\\]"
+      confidence_weight: 0.90
+      context_keywords: ["code", "otp"]
+      
+    - name: "alphanumeric_token"
+      pattern: "\\b([A-Z0-9]{8,12})\\b"
+      confidence_weight: 0.75
+      context_keywords: ["token", "verification"]
+
+  # NLP Model Configuration
+  nlp:
+    model_name: "en_core_web_sm"  # spaCy model
+    use_transformer: false  # Set to true for higher accuracy (e.g., "distilbert-base-uncased")
+    transformer_model: "distilbert-base-uncased"
+    confidence_threshold: 0.7  # Minimum confidence to accept extraction
+    semantic_search_enabled: true
+    
+  # Post-extraction validation rules
+  validation_rules:
+    - name: "no_sequential_digits"
+      rule: "reject if pattern matches 123456 or 000000"
+    - name: "balanced_frequency"
+      rule: "reject if any digit appears more than 5 times"
+    - name: "context_coherence"
+      rule: "boost score if found near OTP-related keywords"
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# 6. RESILIENCE & FAILOVER POLICIES
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+resilience:
+  # Circuit Breaker Pattern
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 5          # Open after 5 consecutive failures
+    success_threshold: 2          # Close after 2 consecutive successes
+    timeout_seconds: 60           # Time in OPEN state before trying HALF_OPEN
+    
+  # Retry Strategy
+  retry:
+    enabled: true
+    max_attempts: 3
+    initial_backoff_seconds: 1
+    max_backoff_seconds: 30
+    backoff_multiplier: 2.0       # Exponential backoff
+    jitter_enabled: true
+    jitter_factor: 0.1
+    
+  # Health Check Configuration
+  health_check:
+    enabled: true
+    interval_seconds: 30
+    timeout_seconds: 10
+    
+    # Metrics triggering provider failover
+    thresholds:
+      error_rate: 0.15            # 15% error rate triggers failover
+      latency_p99_ms: 5000        # 5s P99 latency triggers failover
+      consecutive_failures: 5     # 5 consecutive failures
+      availability_window_minutes: 10
+      
+  # Failover Strategy
+  failover:
+    strategy: "round_robin"       # round_robin, least_loaded, weighted, fastest
+    max_providers_in_rotation: 3
+    cooldown_period_seconds: 120
+    notify_on_failover: true
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# 7. PROCESSING PIPELINE CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+pipeline:
+  # Preprocessing step
+  preprocessing:
+    enabled: true
+    normalize_text: true          # Lowercase, remove extra spaces
+    remove_html_tags: true
+    decode_unicode: true
+    max_message_size_bytes: 10240  # 10KB limit
+    
+  # Deduplication Configuration
+  deduplication:
+    enabled: true
+    strategy: "redis_hash"        # redis_hash, memory_cache, hybrid
+    key_format: "otp:dedup:{timestamp_hour}:{normalized_text_hash}"
+    similarity_threshold: 0.95    # Fuzzy matching threshold (0-1.0)
+    
+  # State Management
+  state:
+    store: "redis"                # redis, dynamodb, postgresql
+    consistency_level: "eventual" # strong, eventual
+    
+  # Output/Delivery Configuration
+  output:
+    enabled: true
+    targets:
+      - type: "kafka"
+        topic: "otp.extracted-otps"
+        partitioning: "by_provider"
+      - type: "http_webhook"
+        url: "${OUTPUT_WEBHOOK_URL}"
+        auth_header: "X-API-Key: ${OUTPUT_API_KEY}"
+        retry_policy: "exponential_backoff"
+        
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# 8. PERFORMANCE & SCALING CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+performance:
+  # Async/Await Task Configuration
+  concurrency:
+    max_worker_threads: 200
+    max_async_tasks: 5000
+    task_queue_size: 50000
+    worker_idle_timeout_seconds: 300
+    
+  # Connection Pooling
+  connection_pools:
+    http_pool_size: 100
+    redis_pool_size: 100
+    kafka_producer_pool_size: 50
+    
+  # Rate Limiting (per service, global, per provider)
+  rate_limiting:
+    enabled: true
+    global_rps: 10000             # 10k requests/sec max
+    per_provider_rps: 1000        # 1k requests/sec per provider
+    per_user_rps: 100             # 100 requests/sec per API user
+    burst_allowance: 1.5          # 50% burst tolerance
+    
+  # Timeout Configuration
+  timeouts:
+    http_request_default: 30
+    database_query: 15
+    cache_operation: 5
+    message_processing: 60
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# 9. OBSERVABILITY CONFIGURATION (Logging, Metrics, Tracing)
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+observability:
+  logging:
+    format: "json"                # json, text
+    output: "stdout"              # stdout, file, syslog, elasticsearch
+    elasticsearch:
+      endpoint: "${ELK_ENDPOINT}"
+      index_pattern: "otp-logs-{date}"
+      
+  metrics:
+    enabled: true
+    provider: "prometheus"
+    endpoint: "0.0.0.0:9090"
+    scrape_interval_seconds: 15
+    retention_days: 30
+    
+    # Key metrics to track
+    tracked_metrics:
+      - "otp_extraction_rate"
+      - "message_processing_latency_p50_p95_p99"
+      - "provider_availability"
+      - "circuit_breaker_state"
+      - "redis_operations_latency"
+      - "kafka_lag_by_consumer_group"
+      - "system_error_rate"
+      
+  tracing:
+    enabled: true
+    provider: "jaeger"
+    jaeger_endpoint: "http://jaeger-collector:14268/api/traces"
+    sample_rate: 0.1              # 10% sampling for production
+    
+  alerting:
+    enabled: true
+    slack_webhook: "${SLACK_WEBHOOK_URL}"
+    alert_rules:
+      - name: "HighErrorRate"
+        condition: "error_rate > 5%"
+        severity: "critical"
+      - name: "ProviderDown"
+        condition: "provider_availability < 50%"
+        severity: "critical"
+      - name: "HighLatency"
+        condition: "p99_latency > 10s"
+        severity: "warning"
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# 10. SECURITY CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+security:
+  # Authentication & Authorization
+  auth:
+    enabled: true
+    jwt_secret: "${JWT_SECRET}"
+    jwt_algorithm: "HS256"
+    token_expiry_minutes: 60
+    
+  # mTLS for service-to-service communication
+  mtls:
+    enabled: true
+    cert_path: "/etc/ssl/certs/service.crt"
+    key_path: "/etc/ssl/certs/service.key"
+    ca_cert_path: "/etc/ssl/certs/ca.crt"
+    verify_hostname: true
+    
+  # Data Encryption
+  encryption:
+    at_rest: true
+    algorithm: "AES-256-GCM"
+    key_path: "${ENCRYPTION_KEY_PATH}"
+    
+    in_transit: true
+    tls_version: "1.3"
+    
+  # Secrets Management
+  secrets:
+    provider: "vault"
+    vault_url: "${VAULT_URL}"
+    vault_token: "${VAULT_TOKEN}"
+    vault_engine: "kv"
+    vault_path: "secret/otp-system/"
+    
+  # Audit Logging
+  audit:
+    enabled: true
+    log_sensitive_data: false     # IMPORTANT: Do not log OTPs or secrets
+    audit_log_output: "elasticsearch"
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# 11. SLA & OPERATIONAL TARGETS (SLO, SLI)
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+sla:
+  availability_target: 0.999      # 99.9% uptime (8.76 hours/year)
+  latency_p99_target_ms: 500      # 99th percentile latency < 500ms
+  error_rate_target: 0.001        # < 0.1% error rate
+  extraction_accuracy_target: 0.98  # 98% correct OTP extractions
+  
+  # Error Budgets (allowed failures)
+  error_budget:
+    availability_budget_minutes_per_month: 43.2  # (1 - 0.999) * minutes in month
+    
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# 12. DEPLOYMENT CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+deployment:
+  type: "kubernetes"              # kubernetes, docker-compose, bare-metal
+  namespace: "otp-system"
+  replicas:
+    collector: 3
+    intelligence: 2
+    processor: 3
+    resilience_manager: 1
+    orchestrator: 1
+    
+  resources:
+    collector:
+      cpu_request: "500m"
+      memory_request: "512Mi"
+      cpu_limit: "2000m"
+      memory_limit: "2Gi"
+    intelligence:
+      cpu_request: "1000m"
+      memory_request: "1Gi"
+      cpu_limit: "4000m"
+      memory_limit: "4Gi"
+    processor:
+      cpu_request: "500m"
+      memory_request: "256Mi"
+      cpu_limit: "2000m"
+      memory_limit: "2Gi"
+      
+  # Horizontal Pod Autoscaling
+  autoscaling:
+    enabled: true
+    min_replicas: 2
+    max_replicas: 20
+    target_cpu_utilization: 70
+    target_memory_utilization: 80
+    scale_down_stabilization_seconds: 300
+    scale_up_stabilization_seconds: 60

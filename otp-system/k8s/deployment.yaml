@@ -1,0 +1,684 @@
+---
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════
+# Kubernetes Deployment Manifests for OTP Processing System
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════
+# This file contains all K8s resources needed to deploy the system:
+# - Deployment for each microservice (with replicas and resource limits)
+# - Service definitions for internal/external communication
+# - ConfigMap for configuration management
+# - Secrets for sensitive credentials
+# - StatefulSet for Redis (if not using managed Redis)
+# - HorizontalPodAutoscaler for automatic scaling
+# - NetworkPolicy for security
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: otp-system
+  labels:
+    environment: production
+
+---
+# ConfigMap: System Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otp-system-config
+  namespace: otp-system
+data:
+  config.yaml: |
+    system:
+      name: "OTP-Processing-System"
+      version: "1.0.0"
+      environment: "production"
+      log_level: "INFO"
+      max_concurrent_tasks: 10000
+    
+    redis:
+      primary:
+        urls:
+          - "redis://redis-primary:6379/0"
+        db: 0
+        pool_size: 100
+        max_connections: 500
+    
+    resilience:
+      circuit_breaker:
+        failure_threshold: 5
+        timeout_seconds: 60
+      failover:
+        strategy: "fastest"
+
+---
+# Secret: Sensitive Configuration
+apiVersion: v1
+kind: Secret
+metadata:
+  name: otp-system-secrets
+  namespace: otp-system
+type: Opaque
+stringData:
+  redis-password: "SET_YOUR_REDIS_PASSWORD"
+  jwt-secret: "SET_YOUR_JWT_SECRET"
+  email-user: "your-email@gmail.com"
+  email-pass: "your-app-password"
+  webhook-token: "SET_YOUR_WEBHOOK_TOKEN"
+
+---
+# Service: Redis (Internal)
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-primary
+  namespace: otp-system
+  labels:
+    app: redis
+spec:
+  ports:
+    - port: 6379
+      targetPort: 6379
+      name: redis
+  selector:
+    app: redis
+    role: primary
+  clusterIP: None  # Headless service for StatefulSet
+
+---
+# StatefulSet: Redis
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: otp-system
+spec:
+  serviceName: redis-primary
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+        role: primary
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+          name: redis
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        command:
+          - redis-server
+          - "--appendonly"
+          - "yes"
+          - "--requirepass"
+          - "$(REDIS_PASSWORD)"
+        env:
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: otp-system-secrets
+              key: redis-password
+        livenessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 10
+          periodSeconds: 10
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 10Gi
+
+---
+# Deployment: Collector Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: collector
+  namespace: otp-system
+  labels:
+    app: collector
+    service: otp-system
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: collector
+  template:
+    metadata:
+      labels:
+        app: collector
+        service: otp-system
+    spec:
+      serviceAccountName: otp-system
+      containers:
+      - name: collector
+        image: otp-system:latest
+        imagePullPolicy: Always
+        args: ["python", "-m", "services.collector_service"]
+        ports:
+        - containerPort: 8001
+          name: http
+        env:
+        - name: OTP_SYSTEM__ENVIRONMENT
+          value: "production"
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: otp-system-secrets
+              key: redis-password
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8001
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8001
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        volumeMounts:
+        - name: config
+          mountPath: /etc/otp-system
+      volumes:
+      - name: config
+        configMap:
+          name: otp-system-config
+
+---
+# Service: Collector (Internal)
+apiVersion: v1
+kind: Service
+metadata:
+  name: collector
+  namespace: otp-system
+spec:
+  selector:
+    app: collector
+  ports:
+  - port: 8001
+    targetPort: 8001
+    name: http
+
+---
+# Deployment: Intelligence Engine
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: intelligence
+  namespace: otp-system
+  labels:
+    app: intelligence
+    service: otp-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: intelligence
+  template:
+    metadata:
+      labels:
+        app: intelligence
+        service: otp-system
+    spec:
+      serviceAccountName: otp-system
+      containers:
+      - name: intelligence
+        image: otp-system:latest
+        imagePullPolicy: Always
+        args: ["python", "-m", "services.intelligence_engine"]
+        ports:
+        - containerPort: 8002
+          name: http
+        env:
+        - name: OTP_SYSTEM__ENVIRONMENT
+          value: "production"
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8002
+          initialDelaySeconds: 15
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8002
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        volumeMounts:
+        - name: config
+          mountPath: /etc/otp-system
+      volumes:
+      - name: config
+        configMap:
+          name: otp-system-config
+
+---
+# Service: Intelligence (Internal)
+apiVersion: v1
+kind: Service
+metadata:
+  name: intelligence
+  namespace: otp-system
+spec:
+  selector:
+    app: intelligence
+  ports:
+  - port: 8002
+    targetPort: 8002
+    name: http
+
+---
+# Deployment: Processor Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: processor
+  namespace: otp-system
+  labels:
+    app: processor
+    service: otp-system
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: processor
+  template:
+    metadata:
+      labels:
+        app: processor
+        service: otp-system
+    spec:
+      serviceAccountName: otp-system
+      containers:
+      - name: processor
+        image: otp-system:latest
+        imagePullPolicy: Always
+        args: ["python", "-m", "services.processor_service"]
+        ports:
+        - containerPort: 8003
+          name: http
+        env:
+        - name: OTP_SYSTEM__ENVIRONMENT
+          value: "production"
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: otp-system-secrets
+              key: redis-password
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8003
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8003
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        volumeMounts:
+        - name: config
+          mountPath: /etc/otp-system
+      volumes:
+      - name: config
+        configMap:
+          name: otp-system-config
+
+---
+# Service: Processor (Internal)
+apiVersion: v1
+kind: Service
+metadata:
+  name: processor
+  namespace: otp-system
+spec:
+  selector:
+    app: processor
+  ports:
+  - port: 8003
+    targetPort: 8003
+    name: http
+
+---
+# Deployment: Resilience Manager
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: resilience-manager
+  namespace: otp-system
+  labels:
+    app: resilience-manager
+    service: otp-system
+spec:
+  replicas: 1  # Stateful, single instance
+  selector:
+    matchLabels:
+      app: resilience-manager
+  template:
+    metadata:
+      labels:
+        app: resilience-manager
+        service: otp-system
+    spec:
+      serviceAccountName: otp-system
+      containers:
+      - name: resilience-manager
+        image: otp-system:latest
+        imagePullPolicy: Always
+        args: ["python", "-m", "services.resilience_manager"]
+        ports:
+        - containerPort: 8004
+          name: http
+        env:
+        - name: OTP_SYSTEM__ENVIRONMENT
+          value: "production"
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: otp-system-secrets
+              key: redis-password
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8004
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        volumeMounts:
+        - name: config
+          mountPath: /etc/otp-system
+      volumes:
+      - name: config
+        configMap:
+          name: otp-system-config
+
+---
+# Service: Resilience Manager (Internal)
+apiVersion: v1
+kind: Service
+metadata:
+  name: resilience-manager
+  namespace: otp-system
+spec:
+  selector:
+    app: resilience-manager
+  ports:
+  - port: 8004
+    targetPort: 8004
+    name: http
+
+---
+# Deployment: API Gateway
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: otp-system
+  labels:
+    app: api-gateway
+    service: otp-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api-gateway
+  template:
+    metadata:
+      labels:
+        app: api-gateway
+        service: otp-system
+    spec:
+      serviceAccountName: otp-system
+      containers:
+      - name: api-gateway
+        image: otp-system:latest
+        imagePullPolicy: Always
+        args: ["python", "-m", "api.gateway"]
+        ports:
+        - containerPort: 8000
+          name: http
+        env:
+        - name: OTP_SYSTEM__ENVIRONMENT
+          value: "production"
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: otp-system-secrets
+              key: jwt-secret
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+
+---
+# Service: API Gateway (External)
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-gateway
+  namespace: otp-system
+spec:
+  type: LoadBalancer
+  selector:
+    app: api-gateway
+  ports:
+  - port: 80
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  - port: 443
+    targetPort: 8443
+    protocol: TCP
+    name: https
+
+---
+# HorizontalPodAutoscaler: Processor
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: processor-hpa
+  namespace: otp-system
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: processor
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 30
+
+---
+# HorizontalPodAutoscaler: Collector
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: collector-hpa
+  namespace: otp-system
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: collector
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+
+---
+# ServiceAccount: OTP System
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otp-system
+  namespace: otp-system
+
+---
+# RBAC: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: otp-system
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list"]
+
+---
+# RBAC: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: otp-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: otp-system
+subjects:
+- kind: ServiceAccount
+  name: otp-system
+  namespace: otp-system
+
+---
+# NetworkPolicy: Restrict traffic
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: otp-system-network-policy
+  namespace: otp-system
+spec:
+  podSelector:
+    matchLabels:
+      service: otp-system
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          service: otp-system
+    - podSelector:
+        matchLabels:
+          app: api-gateway
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: redis
+  - to:
+    - podSelector:
+        matchLabels:
+          service: otp-system
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+    ports:
+    - protocol: TCP
+      port: 53
+    - protocol: UDP
+      port: 53

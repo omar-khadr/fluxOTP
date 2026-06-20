@@ -1,0 +1,265 @@
+version: '3.8'
+
+services:
+  # Redis for state management and deduplication
+  redis:
+    image: redis:7-alpine
+    container_name: otp-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --requirepass otp_redis_dev
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    environment:
+      - REDIS_PASSWORD=otp_redis_dev
+    networks:
+      - otp-network
+
+  # Kafka for message brokering
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: otp-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_SYNC_LIMIT: 2
+      ZOOKEEPER_INIT_LIMIT: 5
+    ports:
+      - "2181:2181"
+    networks:
+      - otp-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: otp-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LOG_RETENTION_HOURS: 24
+    networks:
+      - otp-network
+
+  # Prometheus for metrics
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: otp-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - otp-network
+
+  # Jaeger for distributed tracing
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: otp-jaeger
+    ports:
+      - "6831:6831/udp"
+      - "16686:16686"
+    environment:
+      - COLLECTOR_ZIPKIN_HOST_PORT=:9411
+    networks:
+      - otp-network
+
+  # Elasticsearch for logging
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.10.0
+    container_name: otp-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - otp-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200 >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Kibana for log visualization
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.10.0
+    container_name: otp-kibana
+    environment:
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch
+    networks:
+      - otp-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:5601 >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # OTP System: Collector Service
+  collector:
+    build: .
+    container_name: otp-collector
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+    ports:
+      - "8001:8001"
+    environment:
+      - OTP_SYSTEM__ENVIRONMENT=development
+      - OTP_SYSTEM__LOG_LEVEL=DEBUG
+      - OTP_REDIS__PRIMARY__URLS=["redis://redis:6379/0"]
+      - OTP_REDIS__PRIMARY__PASSWORD=otp_redis_dev
+      - PYTHONUNBUFFERED=1
+    command: ["python", "-m", "services.collector_service"]
+    volumes:
+      - ./config:/app/config
+      - ./services:/app/services
+      - ./shared:/app/shared
+    networks:
+      - otp-network
+    restart: unless-stopped
+
+  # OTP System: Intelligence Engine
+  intelligence:
+    build: .
+    container_name: otp-intelligence
+    depends_on:
+      - kafka
+    ports:
+      - "8002:8002"
+    environment:
+      - OTP_SYSTEM__ENVIRONMENT=development
+      - OTP_SYSTEM__LOG_LEVEL=DEBUG
+      - PYTHONUNBUFFERED=1
+    command: ["python", "-m", "services.intelligence_engine"]
+    volumes:
+      - ./config:/app/config
+      - ./services:/app/services
+      - ./shared:/app/shared
+    networks:
+      - otp-network
+    restart: unless-stopped
+
+  # OTP System: Processor Service
+  processor:
+    build: .
+    container_name: otp-processor
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+    ports:
+      - "8003:8003"
+    environment:
+      - OTP_SYSTEM__ENVIRONMENT=development
+      - OTP_SYSTEM__LOG_LEVEL=DEBUG
+      - OTP_REDIS__PRIMARY__URLS=["redis://redis:6379/0"]
+      - OTP_REDIS__PRIMARY__PASSWORD=otp_redis_dev
+      - PYTHONUNBUFFERED=1
+    command: ["python", "-m", "services.processor_service"]
+    volumes:
+      - ./config:/app/config
+      - ./services:/app/services
+      - ./shared:/app/shared
+    networks:
+      - otp-network
+    restart: unless-stopped
+
+  # OTP System: Resilience Manager
+  resilience-manager:
+    build: .
+    container_name: otp-resilience
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8004:8004"
+    environment:
+      - OTP_SYSTEM__ENVIRONMENT=development
+      - OTP_SYSTEM__LOG_LEVEL=DEBUG
+      - OTP_REDIS__PRIMARY__URLS=["redis://redis:6379/0"]
+      - OTP_REDIS__PRIMARY__PASSWORD=otp_redis_dev
+      - PYTHONUNBUFFERED=1
+    command: ["python", "-m", "services.resilience_manager"]
+    volumes:
+      - ./config:/app/config
+      - ./services:/app/services
+      - ./shared:/app/shared
+    networks:
+      - otp-network
+    restart: unless-stopped
+
+  # OTP System: API Gateway
+  api-gateway:
+    build: .
+    container_name: otp-api-gateway
+    depends_on:
+      - processor
+      - intelligence
+      - resilience-manager
+    ports:
+      - "8000:8000"
+    environment:
+      - OTP_SYSTEM__ENVIRONMENT=development
+      - OTP_SYSTEM__LOG_LEVEL=DEBUG
+      - PYTHONUNBUFFERED=1
+    command: ["python", "-m", "api.gateway"]
+    volumes:
+      - ./config:/app/config
+      - ./api:/app/api
+      - ./services:/app/services
+      - ./shared:/app/shared
+    networks:
+      - otp-network
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  prometheus_data:
+  elasticsearch_data:
+
+networks:
+  otp-network:
+    driver: bridge
+
+# Usage:
+# docker-compose up -d                    # Start all services
+# docker-compose logs -f                  # View logs
+# docker-compose logs -f collector        # View specific service logs
+# docker-compose down                     # Stop all services
+# docker-compose ps                       # Check status
+# 
+# Service URLs:
+# API Gateway:         http://localhost:8000
+# Prometheus:          http://localhost:9090
+# Jaeger UI:           http://localhost:16686
+# Kibana:              http://localhost:5601
+# Elasticsearch:       http://localhost:9200
+# Kafka:               localhost:9092
+# Redis:               localhost:6379
